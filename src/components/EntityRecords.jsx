@@ -1,11 +1,17 @@
 import React, { useMemo, useState, useRef, useEffect } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { motion } from "framer-motion";
-import { Search, Download, Columns, X } from "lucide-react";
+import {
+  Search,
+  Download,
+  Columns,
+  X,
+  RefreshCw,
+  Trash2,        // 👈 NEW
+} from "lucide-react";
 import * as XLSX from "xlsx";
 
 import "ag-grid-community/styles/ag-theme-alpine.css";
-
 
 export default function EntityRecords({
   rowData = [],
@@ -14,8 +20,10 @@ export default function EntityRecords({
   gridOptions = {},
   pageSize = 10,
   theme = "light",
+  onRefresh = null,
   onRowDoubleClicked = null,
   onSelectionChanged = null,
+  onDeleteRow = null,          // 👈 NEW
 }) {
   const gridRef = useRef(null);
 
@@ -24,6 +32,26 @@ export default function EntityRecords({
   const [colSearch, setColSearch] = useState("");
   const [localColumnDefs, setLocalColumnDefs] = useState([]);
   const [visibleMap, setVisibleMap] = useState({});
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // small delete cell renderer using lucide-react
+  const deleteCellRenderer = (params) => {
+    if (!onDeleteRow) return null;
+    const row = params.data;
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation(); // don't trigger row selection / double-click
+          onDeleteRow(row);
+        }}
+        className="inline-flex items-center justify-center w-8 h-8 rounded-full border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+        title="Delete row"
+      >
+        <Trash2 className="w-4 h-4" />
+      </button>
+    );
+  };
 
   // default column def
   const makeDefaultColDef = useMemo(
@@ -40,7 +68,6 @@ export default function EntityRecords({
 
   // capture grid api on ready
   function onGridReady(params) {
-    // Initialize visibleMap from current columns
     const cols = params.api.getAllDisplayedColumns() || [];
     const vm = {};
     cols.forEach((c) => {
@@ -52,19 +79,42 @@ export default function EntityRecords({
 
   // derive columns if external not provided
   useEffect(() => {
+    // helper to optionally add actions column
+    const withActions = (cols) => {
+      if (!onDeleteRow) return cols;
+      const hasActions = cols.some((c) => c.field === "__actions");
+      if (hasActions) return cols;
+
+      return [
+        ...cols,
+        {
+          field: "__actions",
+          headerName: "",
+          width: 90,
+          sortable: false,
+          filter: false,
+          pinned: "right",
+          cellRenderer: deleteCellRenderer,
+        },
+      ];
+    };
+
     if (externalColumnDefs && externalColumnDefs.length) {
-      setLocalColumnDefs(externalColumnDefs);
-      // set visibility map
+      const cols = withActions(externalColumnDefs);
+      setLocalColumnDefs(cols);
+
       const vm = {};
-      externalColumnDefs.forEach((c) => (vm[c.field] = true));
+      cols.forEach((c) => (vm[c.field] = true));
       setVisibleMap((s) => ({ ...vm, ...s }));
       return;
     }
+
     const first = rowData && rowData.length ? rowData[0] : null;
     if (!first) {
-      setLocalColumnDefs([]);
+      setLocalColumnDefs(withActions([]));
       return;
     }
+
     const keys = Object.keys(first);
     const auto = keys.map((k) => {
       if (k === "score") {
@@ -82,11 +132,14 @@ export default function EntityRecords({
         return { field: k, headerName: "Created At", width: 180 };
       return { field: k, headerName: startCase(k) };
     });
-    setLocalColumnDefs(auto);
+
+    const cols = withActions(auto);
+    setLocalColumnDefs(cols);
+
     const vm = {};
-    auto.forEach((c) => (vm[c.field] = true));
+    cols.forEach((c) => (vm[c.field] = true));
     setVisibleMap((s) => ({ ...vm, ...s }));
-  }, [rowData, externalColumnDefs]);
+  }, [rowData, externalColumnDefs, onDeleteRow]); // 👈 include onDeleteRow
 
   // helper: Title case
   function startCase(str = "") {
@@ -116,7 +169,6 @@ export default function EntityRecords({
     if (!gridRef.current?.api) return;
 
     try {
-      // Get all displayed rows (respects filters and sorting)
       const allDisplayedRows = [];
       gridRef.current.api.forEachNodeAfterFilterAndSort((node) => {
         allDisplayedRows.push(node.data);
@@ -127,14 +179,20 @@ export default function EntityRecords({
         return;
       }
 
-      // Get visible columns
-      const visibleColumns = gridRef.current.api.getAllDisplayedColumns();
+      // filter out selection + actions column
+      const visibleColumns = gridRef.current.api
+        .getAllDisplayedColumns()
+        .filter(
+          (col) =>
+            col.getColId() !== "ag-Grid-SelectionColumn" &&
+            col.getColId() !== "__actions" // 👈 NEW
+        );
+
       const headers = visibleColumns.map(
         (col) => col.getColDef().headerName || col.getColId()
       );
       const fields = visibleColumns.map((col) => col.getColId());
 
-      // Prepare data for Excel
       const excelData = allDisplayedRows.map((row) => {
         const rowData = {};
         visibleColumns.forEach((col, index) => {
@@ -142,7 +200,6 @@ export default function EntityRecords({
           const colDef = col.getColDef();
           let value = row[field];
 
-          // Apply value formatter if exists
           if (colDef.valueFormatter && value != null) {
             const params = {
               value,
@@ -160,24 +217,20 @@ export default function EntityRecords({
         return rowData;
       });
 
-      // Create worksheet
       const ws = XLSX.utils.json_to_sheet(excelData);
 
-      // Auto-size columns with proper width for date/time columns
       const colWidths = headers.map((header, index) => {
         const field = fields[index];
 
-        // Special handling for date/time columns
         if (
           field.includes("date") ||
           field.includes("created_at") ||
           field.includes("updated_at") ||
           field.includes("time")
         ) {
-          return { wch: 20 }; // Fixed width for date columns
+          return { wch: 20 };
         }
 
-        // Calculate max width based on header and data
         let maxWidth = header.length;
 
         excelData.forEach((row) => {
@@ -185,21 +238,17 @@ export default function EntityRecords({
           maxWidth = Math.max(maxWidth, cellValue.length);
         });
 
-        // Limit max width to reasonable values
         return { wch: Math.min(Math.max(maxWidth + 2, 10), 50) };
       });
 
       ws["!cols"] = colWidths;
 
-      // Create workbook and add worksheet
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Data");
 
-      // Generate filename with timestamp
       const timestamp = new Date().toISOString().split("T")[0];
       const fileName = `export_${timestamp}.xlsx`;
 
-      // Export file
       XLSX.writeFile(wb, fileName);
     } catch (error) {
       console.error("Export error:", error);
@@ -222,20 +271,30 @@ export default function EntityRecords({
     onSelectionChanged(selected);
   }
 
-  // make resolved grid options with proper rowSelection format
+  // refresh data handler
+  async function handleRefresh() {
+    setIsRefreshing(true);
+    try {
+      if (onRefresh) {
+        await onRefresh();
+      }
+    } catch (error) {
+      console.error("Refresh error:", error);
+    } finally {
+      setIsRefreshing(false);
+    }
+  }
+
   const resolvedGridOptions = useMemo(() => {
-    // Handle rowSelection properly for AG Grid v31+
     let rowSelection = { mode: "singleRow" };
 
     if (gridOptions.rowSelection) {
       if (typeof gridOptions.rowSelection === "string") {
-        // Legacy format: convert to new format
         rowSelection = {
           mode:
             gridOptions.rowSelection === "multiple" ? "multiRow" : "singleRow",
         };
       } else if (gridOptions.rowSelection.type) {
-        // Another legacy format with type property
         rowSelection = {
           mode:
             gridOptions.rowSelection.type === "multiple"
@@ -262,14 +321,12 @@ export default function EntityRecords({
     };
   }, [gridOptions, pageSize]);
 
-  // filtered column list for the menu
   const filteredCols = localColumnDefs.filter((c) =>
     (c.headerName || c.field || "")
       .toLowerCase()
       .includes(colSearch.toLowerCase())
   );
 
-  // choose theme class
   const themeClass =
     theme === "dark" ? "ag-theme-alpine-dark" : "ag-theme-alpine";
 
@@ -281,35 +338,49 @@ export default function EntityRecords({
       className="w-full"
     >
       {/* top controls */}
-      <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3 mb-4">
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full lg:w-auto">
-          <div className="relative flex-1 sm:flex-none w-full sm:w-72">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-            <input
-              value={quickFilter}
-              onChange={(e) => handleQuickFilterChange(e.target.value)}
-              placeholder="Search across rows..."
-              className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 focus:border-transparent transition-all"
-            />
-          </div>
+      <div className="flex flex-col gap-3 mb-4">
+        {/* First row: Search input - full width */}
+        <div className="relative w-full">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+          <input
+            value={quickFilter}
+            onChange={(e) => handleQuickFilterChange(e.target.value)}
+            placeholder="Search across rows..."
+            className="w-full pl-9 pr-3 py-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 focus:border-transparent transition-all"
+          />
+        </div>
 
-          <div className="flex items-center gap-2">
+        {/* Second row: Buttons and info - responsive grid */}
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-1 sm:flex-none">
+            <motion.button
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+              className="flex-1 sm:flex-none inline-flex items-center justify-center gap-2 text-sm font-medium px-4 py-2.5 bg-blue-600 dark:bg-blue-700 text-white border border-blue-700 dark:border-blue-600 rounded-lg shadow-sm hover:bg-blue-700 dark:hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              title="Refresh data"
+            >
+              <RefreshCw className={`w-4 h-4 ${isRefreshing ? "animate-spin" : ""}`} />
+              <span className="hidden sm:inline">Refresh</span>
+            </motion.button>
+
             <button
               onClick={onExportExcel}
-              className="inline-flex items-center justify-center gap-2 text-sm font-medium px-4 py-2.5 bg-emerald-600 dark:bg-emerald-700 text-white border border-emerald-700 dark:border-emerald-600 rounded-lg shadow-sm hover:bg-emerald-700 dark:hover:bg-emerald-600 transition-colors"
+              className="flex-1 sm:flex-none inline-flex items-center justify-center gap-2 text-sm font-medium px-4 py-2.5 bg-emerald-600 dark:bg-emerald-700 text-white border border-emerald-700 dark:border-emerald-600 rounded-lg shadow-sm hover:bg-emerald-700 dark:hover:bg-emerald-600 transition-colors"
               title="Export to Excel"
             >
               <Download className="w-4 h-4" />
               <span className="hidden sm:inline">Export Excel</span>
             </button>
 
-            <div className="relative">
+            <div className="relative flex-1 sm:flex-none">
               <button
                 onClick={() => {
                   setShowColumnsMenu((s) => !s);
                   setColSearch("");
                 }}
-                className="inline-flex items-center justify-center gap-2 text-sm font-medium px-4 py-2.5 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 text-sm font-medium px-4 py-2.5 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
               >
                 <Columns className="w-4 h-4" />
                 <span className="hidden sm:inline">Columns</span>
@@ -376,14 +447,14 @@ export default function EntityRecords({
               )}
             </div>
           </div>
-        </div>
 
-        <div className="text-sm text-slate-600 dark:text-slate-400 font-medium">
-          Showing{" "}
-          <span className="text-slate-900 dark:text-slate-100 font-semibold">
-            {rowData?.length ?? 0}
-          </span>{" "}
-          rows
+          <div className="text-sm text-slate-600 dark:text-slate-400 font-medium whitespace-nowrap">
+            Showing{" "}
+            <span className="text-slate-900 dark:text-slate-100 font-semibold">
+              {rowData?.length ?? 0}
+            </span>{" "}
+            rows
+          </div>
         </div>
       </div>
 
